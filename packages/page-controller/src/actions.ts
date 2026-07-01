@@ -261,16 +261,31 @@ interface ScrollableElement extends Element {
 
 /**
  * @private Internal method, subject to change at any time.
+ * @edit Recursively scroll all ancestor frames into view, not just the immediate parent.
+ *       This fixes nested-iframe scenarios where the element is buried 2+ levels deep.
  */
 export async function scrollIntoViewIfNeeded(element: Element) {
 	const el = element as ScrollableElement
 	if (typeof el.scrollIntoViewIfNeeded === 'function') {
 		el.scrollIntoViewIfNeeded()
-		// await waitFor(0.5) // Animation playback
 	} else {
 		// @todo visibility check
 		element.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' })
-		// await waitFor(0.5) // Animation playback
+	}
+
+	// Recursively scroll ancestor iframes so the element is visible in every frame.
+	const doc = element.ownerDocument
+	let frame = doc.defaultView?.frameElement as ScrollableElement | null
+	while (frame) {
+		if (typeof frame.scrollIntoViewIfNeeded === 'function') {
+			frame.scrollIntoViewIfNeeded()
+		} else {
+			frame.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' })
+		}
+		const parentDoc = frame.ownerDocument
+		frame = parentDoc && parentDoc !== window.document
+			? (parentDoc.defaultView?.frameElement as ScrollableElement | null)
+			: null
 	}
 }
 
@@ -553,4 +568,187 @@ export async function scrollHorizontally(scroll_amount: number, element?: HTMLEl
 			return `✅ ${warningMsg} Scrolled container (${el!.tagName}) by ${scrolled}px. Reached the left edge.`
 		return `✅ ${warningMsg} Scrolled container (${el!.tagName}) horizontally by ${scrolled}px.`
 	}
+}
+
+// ======= Character-by-character input (autocomplete/suggestion support) =======
+
+/**
+ * Type text character by character, simulating real keyboard input.
+ * Each character dispatches a full keydown → input → keyup event sequence.
+ * This triggers debounced autocomplete/suggestion backends correctly.
+ *
+ * @private Internal method, subject to change at any time.
+ */
+export async function inputTextCharacterByCharacter(
+	element: HTMLElement,
+	text: string,
+	options?: {
+		/** Delay between each character in ms (default: 50) */
+		charDelay?: number
+		/** Keep focus after typing; do not blur (default: true) */
+		keepFocus?: boolean
+	}
+): Promise<void> {
+	const charDelay = options?.charDelay ?? 50
+	const keepFocus = options?.keepFocus ?? true
+
+	// Focus and scroll into view first
+	await clickElement(element)
+
+	const isInput = isInputElement(element) || isTextAreaElement(element)
+
+	// Clear existing value
+	if (isInput) {
+		const setter = getNativeValueSetter(element as HTMLInputElement | HTMLTextAreaElement)
+		setter.call(element, '')
+		element.dispatchEvent(new Event('input', { bubbles: true }))
+	} else if (element.isContentEditable) {
+		element.focus()
+		const doc = element.ownerDocument
+		const selection = (doc.defaultView || window).getSelection()
+		const range = doc.createRange()
+		range.selectNodeContents(element)
+		selection?.removeAllRanges()
+		selection?.addRange(range)
+		// eslint-disable-next-line @typescript-eslint/no-deprecated
+		doc.execCommand('delete', false)
+	}
+
+	// Type each character
+	for (const char of text) {
+		const keyCode = char.charCodeAt(0)
+
+		// keydown
+		element.dispatchEvent(
+			new KeyboardEvent('keydown', {
+				key: char,
+				code: `Key${char.toUpperCase()}`,
+				keyCode,
+				charCode: 0,
+				bubbles: true,
+				cancelable: true,
+			})
+		)
+
+		// Append character to value
+		if (isInput) {
+			const current = (element as HTMLInputElement).value
+			const setter = getNativeValueSetter(
+				element as HTMLInputElement | HTMLTextAreaElement
+			)
+			setter.call(element, current + char)
+		} else if (element.isContentEditable) {
+			const doc = element.ownerDocument
+			// eslint-disable-next-line @typescript-eslint/no-deprecated
+			doc.execCommand('insertText', false, char)
+		}
+
+		// input event (triggers framework listeners / debounce)
+		element.dispatchEvent(new Event('input', { bubbles: true }))
+
+		// keypress (deprecated but some frameworks still listen)
+		element.dispatchEvent(
+			new KeyboardEvent('keypress', {
+				key: char,
+				charCode: keyCode,
+				keyCode,
+				bubbles: true,
+				cancelable: true,
+			})
+		)
+
+		// keyup
+		element.dispatchEvent(
+			new KeyboardEvent('keyup', {
+				key: char,
+				code: `Key${char.toUpperCase()}`,
+				keyCode,
+				charCode: 0,
+				bubbles: true,
+				cancelable: true,
+			})
+		)
+
+		await waitFor(charDelay / 1000)
+	}
+
+	// Dispatch change event
+	element.dispatchEvent(new Event('change', { bubbles: true }))
+
+	if (!keepFocus) {
+		await waitFor(0.1)
+		blurLastClickedElement()
+	}
+}
+
+// ======= Send keys (Enter, Tab, Arrow keys, etc.) =======
+
+const KEY_CODE_MAP: Record<string, number> = {
+	Enter: 13,
+	Tab: 9,
+	Escape: 27,
+	ArrowDown: 40,
+	ArrowUp: 38,
+	ArrowLeft: 37,
+	ArrowRight: 39,
+	Backspace: 8,
+	Delete: 46,
+	' ': 32,
+	Home: 36,
+	End: 35,
+	PageUp: 33,
+	PageDown: 34,
+}
+
+/**
+ * Send a keyboard key to the currently focused element.
+ * Supports modifier keys (Ctrl/Shift/Alt/Meta).
+ *
+ * @private Internal method, subject to change at any time.
+ */
+export async function sendKey(
+	key: string,
+	modifiers?: { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean }
+): Promise<void> {
+	const activeEl = document.activeElement as HTMLElement | null
+	if (!activeEl) {
+		throw new Error('No focused element to send key to. Click an element first.')
+	}
+
+	const code = KEY_CODE_MAP[key] ?? key.charCodeAt(0)
+	const isEnter = key === 'Enter'
+
+	const baseOpts: KeyboardEventInit = {
+		key,
+		code: key === ' ' ? 'Space' : key,
+		keyCode: code,
+		charCode: isEnter ? 0 : code,
+		bubbles: true,
+		cancelable: true,
+		ctrlKey: modifiers?.ctrl ?? false,
+		shiftKey: modifiers?.shift ?? false,
+		altKey: modifiers?.alt ?? false,
+		metaKey: modifiers?.meta ?? false,
+	}
+
+	// keydown
+	activeEl.dispatchEvent(new KeyboardEvent('keydown', baseOpts))
+
+	// keypress (not for Enter in some browsers, but we dispatch for compatibility)
+	if (!isEnter) {
+		activeEl.dispatchEvent(new KeyboardEvent('keypress', baseOpts))
+	}
+
+	// keyup
+	activeEl.dispatchEvent(new KeyboardEvent('keyup', baseOpts))
+
+	// Enter special: trigger form submit if inside a form
+	if (isEnter && activeEl.tagName === 'INPUT') {
+		const form = activeEl.closest('form')
+		if (form) {
+			form.requestSubmit()
+		}
+	}
+
+	await waitFor(0.2)
 }

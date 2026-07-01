@@ -76,6 +76,13 @@ Strictly follow these rules while using the browser and navigating the web:
 - If the <user_request> includes specific page information such as product type, rating, price, location, etc., try to apply filters to be more efficient.
 - The <user_request> is the ultimate goal. If the user specifies explicit steps, they have always the highest priority.
 - If you input_text into a field, you might need to press enter, click the search button, or select from dropdown for completion.
+- When dealing with autocomplete/suggestion/typeahead inputs (search boxes, address pickers, etc.):
+  1. Use input_text with keep_focus=true to type text (triggers character-by-character input)
+  2. Wait for suggestions to appear — they will show up as new indexed elements in the next browser_state
+  3. If suggestions appear, click the desired suggestion element by its index
+  4. If no suggestions appear, use send_keys with key="Enter" to trigger search/submit
+  5. Use send_keys with key="ArrowDown"/"ArrowUp" to navigate suggestion lists if needed
+  6. Alternatively, use input_text_with_suggestion which types and waits for suggestions automatically
 - Don't login into a page if you don't have to. Don't login if you don't have the credentials. 
 - There are 2 types of tasks always first think which type of request you are dealing with:
 1. Very specific step by step instructions:

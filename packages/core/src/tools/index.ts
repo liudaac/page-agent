@@ -107,13 +107,25 @@ tools.set(
 tools.set(
 	'input_text',
 	tool({
-		description: 'Click and type text into an interactive input element',
+		description:
+			'Click and type text into an interactive input element. ' +
+			'Set keep_focus=true when the input has autocomplete/suggestions ' +
+			'to keep the dropdown open for selection.',
 		inputSchema: z.object({
 			index: z.int().min(0),
 			text: z.string(),
+			keep_focus: z
+				.boolean()
+				.optional()
+				.describe(
+					'Keep focus after input (default: false). ' +
+					'Set to true for autocomplete/suggestion inputs to keep the dropdown open.'
+				),
 		}),
 		execute: async function (this: PageAgentCore, input) {
-			const result = await this.pageController.inputText(input.index, input.text)
+			const result = await this.pageController.inputText(input.index, input.text, {
+				keepFocus: input.keep_focus,
+			})
 			return result.message
 		},
 	})
@@ -180,6 +192,63 @@ tools.set(
 )
 
 tools.set(
+	'input_text_with_suggestion',
+	tool({
+		description:
+			'Input text character by character and wait for autocomplete suggestions to appear. ' +
+			'Use this for search boxes, address pickers, and any input that triggers a backend query on typing. ' +
+			'After this action, new suggestion elements will appear with indexes you can click.',
+		inputSchema: z.object({
+			index: z.int().min(0),
+			text: z.string(),
+			timeout: z
+				.number()
+				.min(500)
+				.max(10000)
+				.optional()
+				.describe('Max ms to wait for suggestions (default: 3000)'),
+		}),
+		execute: async function (this: PageAgentCore, input) {
+			const result = await this.pageController.inputTextWithSuggestion(
+				input.index,
+				input.text,
+				{ timeout: input.timeout }
+			)
+			return result.message
+		},
+	})
+)
+
+tools.set(
+	'send_keys',
+	tool({
+		description:
+			'Send a keyboard key to the currently focused element. ' +
+			'Use after input_text to press Enter (submit/search), ' +
+			'ArrowDown/ArrowUp to navigate suggestion lists, ' +
+			'Tab to move to next field, Escape to close popups.\n' +
+			'Common keys: Enter, Tab, Escape, ArrowDown, ArrowUp, ArrowLeft, ArrowRight, Backspace, Delete, Space.\n' +
+			'For typing text, use input_text instead.',
+		inputSchema: z.object({
+			key: z.string().describe('Key name: Enter, Tab, Escape, ArrowDown, etc.'),
+			ctrl: z.boolean().optional(),
+			shift: z.boolean().optional(),
+			alt: z.boolean().optional(),
+			meta: z.boolean().optional(),
+		}),
+		execute: async function (this: PageAgentCore, input) {
+			const result = await this.pageController.sendKeys(input.key, {
+				ctrl: input.ctrl,
+				shift: input.shift,
+				alt: input.alt,
+				meta: input.meta,
+			})
+			return result.message
+		},
+	})
+)
+
+tools.set(
 	'execute_javascript',
 	tool({
 		description:
@@ -197,6 +266,5 @@ tools.set(
 	})
 )
 
-// @todo send_keys
 // @todo upload_file
 // @todo extract_structured_data

@@ -133,6 +133,34 @@ export default (
 	}
 
 	/**
+	 * @edit Recursively accumulate iframe offsets for nested iframes.
+	 * Walks up from the given iframe element through all ancestor frames
+	 * until reaching the top document, summing their bounding rect positions.
+	 */
+	function getAccumulatedIframeOffset(iframeEl) {
+		let offsetX = 0
+		let offsetY = 0
+		let currentEl = iframeEl
+		let currentDoc = iframeEl.ownerDocument
+
+		while (currentDoc && currentDoc !== document) {
+			if (currentEl) {
+				const r = currentEl.getBoundingClientRect()
+				offsetX += r.left
+				offsetY += r.top
+			}
+			// ascend to parent frame
+			const parentWin = currentDoc.defaultView
+			if (!parentWin) break
+			currentEl = parentWin.frameElement
+			if (!currentEl) break
+			currentDoc = currentEl.ownerDocument
+		}
+
+		return { x: offsetX, y: offsetY }
+	}
+
+	/**
 	 * Hash map of DOM nodes indexed by their highlight index.
 	 *
 	 * @type {Object<string, any>}
@@ -239,11 +267,10 @@ export default (
 					.padStart(2, '0')
 
 			// Get iframe offset if necessary
+			// @edit Recursively accumulate offsets for nested iframes.
 			let iframeOffset = { x: 0, y: 0 }
 			if (parentIframe) {
-				const iframeRect = parentIframe.getBoundingClientRect() // Keep getBoundingClientRect for iframe offset
-				iframeOffset.x = iframeRect.left
-				iframeOffset.y = iframeRect.top
+				iframeOffset = getAccumulatedIframeOffset(parentIframe)
 			}
 
 			// Create fragment to hold overlay elements
@@ -315,9 +342,8 @@ export default (
 				let newIframeOffset = { x: 0, y: 0 }
 
 				if (parentIframe) {
-					const iframeRect = parentIframe.getBoundingClientRect() // Keep getBoundingClientRect for iframe
-					newIframeOffset.x = iframeRect.left
-					newIframeOffset.y = iframeRect.top
+					// @edit use accumulated offset for nested iframes
+					newIframeOffset = getAccumulatedIframeOffset(parentIframe)
 				}
 
 				// Update each overlay

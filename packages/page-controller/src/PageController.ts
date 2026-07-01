@@ -9,10 +9,12 @@
 import {
 	clickElement,
 	getElementByIndex,
+	inputTextCharacterByCharacter,
 	inputTextElement,
 	scrollHorizontally,
 	scrollVertically,
 	selectOptionElement,
+	sendKey,
 } from './actions'
 import * as dom from './dom'
 import type { FlatDomTree, InteractiveElementDomNode } from './dom/dom_tree/type'
@@ -270,13 +272,26 @@ export class PageController extends EventTarget {
 
 	/**
 	 * Input text into element by index
+	 * @param options.keepFocus - Keep focus after input (default: false).
+	 *   Set to true for autocomplete/suggestion inputs to keep the dropdown open.
+	 *   When true, uses character-by-character input to trigger framework listeners.
 	 */
-	async inputText(index: number, text: string): Promise<ActionResult> {
+	async inputText(
+		index: number,
+		text: string,
+		options?: { keepFocus?: boolean }
+	): Promise<ActionResult> {
 		try {
 			this.assertIndexed()
 			const element = getElementByIndex(this.selectorMap, index)
 			const elemText = this.elementTextMap.get(index)
-			await inputTextElement(element, text)
+
+			if (options?.keepFocus) {
+				// Character-by-character input, keep focus for suggestion dropdowns
+				await inputTextCharacterByCharacter(element, text, { keepFocus: true })
+			} else {
+				await inputTextElement(element, text)
+			}
 
 			return {
 				success: true,
@@ -286,6 +301,99 @@ export class PageController extends EventTarget {
 			return {
 				success: false,
 				message: `❌ Failed to input text: ${error}`,
+			}
+		}
+	}
+
+	/**
+	 * Input text with autocomplete/suggestion wait.
+	 * Types text character by character, then polls for new interactive elements
+	 * (suggestion list items) appearing on the page.
+	 */
+	async inputTextWithSuggestion(
+		index: number,
+		text: string,
+		options?: {
+			/** Timeout in ms to wait for suggestions (default: 3000) */
+			timeout?: number
+			/** Delay between characters in ms (default: 50) */
+			charDelay?: number
+		}
+	): Promise<ActionResult> {
+		try {
+			this.assertIndexed()
+			const element = getElementByIndex(this.selectorMap, index)
+			const elemText = this.elementTextMap.get(index)
+			const timeout = options?.timeout ?? 3000
+
+			// Record element count before input
+			const countBefore = this.selectorMap.size
+
+			// Type character by character, keeping focus
+			await inputTextCharacterByCharacter(element, text, {
+				charDelay: options?.charDelay,
+				keepFocus: true,
+			})
+
+			// Poll for new interactive elements (suggestion list)
+			const startTime = Date.now()
+			let suggestionsAppeared = false
+
+			while (Date.now() - startTime < timeout) {
+				await this.updateTree()
+				if (this.selectorMap.size > countBefore) {
+					suggestionsAppeared = true
+					break
+				}
+				await new Promise((r) => setTimeout(r, 200))
+			}
+
+			if (suggestionsAppeared) {
+				return {
+					success: true,
+					message:
+						`✅ Input "${text}" into (${elemText ?? index}). ` +
+						`Suggestion list appeared with new elements. ` +
+						`Use get_browser_state to see available options.`,
+				}
+			} else {
+				return {
+					success: true,
+					message:
+						`✅ Input "${text}" into (${elemText ?? index}). ` +
+						`No suggestion appeared within ${timeout}ms. ` +
+						`Try send_keys with key="Enter" to trigger search, or the input may not have autocomplete.`,
+				}
+			}
+		} catch (error) {
+			return {
+				success: false,
+				message: `❌ Failed to input text with suggestion: ${error}`,
+			}
+		}
+	}
+
+	/**
+	 * Send a keyboard key to the currently focused element.
+	 * Supports Enter, Tab, Escape, Arrow keys, Backspace, Delete, etc.
+	 */
+	async sendKeys(
+		key: string,
+		modifiers?: { ctrl?: boolean; shift?: boolean; alt?: boolean; meta?: boolean }
+	): Promise<ActionResult> {
+		try {
+			await sendKey(key, modifiers)
+			const modStr = modifiers
+				? ` with ${JSON.stringify(modifiers)}`
+				: ''
+			return {
+				success: true,
+				message: `✅ Sent key: ${key}${modStr}.`,
+			}
+		} catch (error) {
+			return {
+				success: false,
+				message: `❌ Failed to send key: ${error}`,
 			}
 		}
 	}

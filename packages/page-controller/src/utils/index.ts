@@ -24,12 +24,28 @@ export function isAnchorElement(el: Element): el is HTMLAnchorElement {
 
 // ======= iframe helpers =======
 
-/** Iframe offset for translating element coordinates to top-frame viewport. */
+/**
+ * Iframe offset for translating element coordinates to top-frame viewport.
+ * @edit Recursively accumulate offsets for nested iframes (A→B→element).
+ *       Previously only handled a single iframe level, causing highlight
+ *       labels and click coordinates to be misaligned in nested-iframe pages.
+ */
 export function getIframeOffset(element: HTMLElement): { x: number; y: number } {
-	const frame = element.ownerDocument.defaultView?.frameElement as HTMLElement | null
-	if (!frame) return { x: 0, y: 0 }
-	const rect = frame.getBoundingClientRect()
-	return { x: rect.left, y: rect.top }
+	let offsetX = 0
+	let offsetY = 0
+	let currentDoc = element.ownerDocument
+
+	// Walk up through every ancestor frame until we reach the top document.
+	while (currentDoc && currentDoc !== window.document) {
+		const frame = currentDoc.defaultView?.frameElement as HTMLElement | null
+		if (!frame) break
+		const rect = frame.getBoundingClientRect()
+		offsetX += rect.left
+		offsetY += rect.top
+		currentDoc = frame.ownerDocument // ascend one level
+	}
+
+	return { x: offsetX, y: offsetY }
 }
 
 /**

@@ -3,6 +3,15 @@
  */
 import { PageController } from '@page-agent/page-controller'
 
+/** Message type for frame-aware page control */
+interface PageControlMessage {
+	type: 'PAGE_CONTROL'
+	action: string
+	payload?: any
+	targetTabId?: number
+	frameId?: number
+}
+
 export function initPageController() {
 	let pageController: PageController | null = null
 	let intervalID: number | null = null
@@ -66,7 +75,7 @@ export function initPageController() {
 			return
 		}
 
-		const { action, payload } = message
+		const { action, payload } = message as PageControlMessage
 		const methodName = getMethodName(action)
 
 		const pc = getPC() as any
@@ -82,12 +91,22 @@ export function initPageController() {
 			case 'scroll':
 			case 'scroll_horizontally':
 			case 'execute_javascript':
+			case 'send_keys':
+			case 'input_text_with_suggestion':
 				pc[methodName](...(payload || []))
-					.then((result: any) => sendResponse(result))
+					.then((result: any) => {
+						// @edit: attach frameId to the response so the agent
+						// can identify which frame produced this state
+						if (typeof result === 'object' && result !== null) {
+							result.__frameId = sender.frameId ?? 0
+						}
+						sendResponse(result)
+					})
 					.catch((error: any) =>
 						sendResponse({
 							success: false,
 							error: error instanceof Error ? error.message : String(error),
+							__frameId: sender.frameId ?? 0,
 						})
 					)
 				break
@@ -128,6 +147,12 @@ function getMethodName(action: string): string {
 			return 'scrollHorizontally' as const
 		case 'execute_javascript':
 			return 'executeJavascript' as const
+
+		// @edit: new actions for autocomplete/suggestion support
+		case 'send_keys':
+			return 'sendKeys' as const
+		case 'input_text_with_suggestion':
+			return 'inputTextWithSuggestion' as const
 
 		default:
 			return action

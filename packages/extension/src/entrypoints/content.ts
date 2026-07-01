@@ -7,6 +7,9 @@ const DEBUG_PREFIX = '[Content]'
 export default defineContentScript({
 	matches: ['<all_urls>'],
 	runAt: 'document_end',
+	// @edit Inject into all frames (including iframes) so the agent can
+	// control elements inside same-origin and cross-origin iframes.
+	allFrames: true,
 
 	main() {
 		console.debug(`${DEBUG_PREFIX} Loaded on ${window.location.href}`)

@@ -6,11 +6,26 @@ const PREFIX = '[RemotePageController]'
 
 const debug = console.debug.bind(console, `\x1b[90m${PREFIX}\x1b[0m`)
 
+/** @edit Frame information */
+interface FrameInfo {
+	frameId: number
+	parentFrameId: number
+	url: string
+}
+
+/** @edit Global index → { frameId, localIndex } routing entry */
+interface IndexRoute {
+	frameId: number
+	localIndex: number
+}
+
 function sendMessage(message: {
 	type: 'PAGE_CONTROL'
 	action: string
 	targetTabId: number
 	payload?: any
+	/** @edit Optional frameId for multi-frame routing */
+	frameId?: number
 }): Promise<any> {
 	return chrome.runtime.sendMessage(message).catch((error) => {
 		console.error(PREFIX, message.action, error)
@@ -22,9 +37,18 @@ function sendMessage(message: {
  * Agent side page controller.
  * - live in the agent env (extension page or content script)
  * - communicates with remote PageController via sw
+ * - @edit Supports multi-frame: enumerates all frames in the tab, merges
+ *   their browser states with global index offsets, and routes actions
+ *   to the correct frame based on the global index.
  */
 export class RemotePageController {
 	tabsController: TabsController
+
+	/** @edit Global index → { frameId, localIndex } routing table */
+	private indexRouteMap = new Map<number, IndexRoute>()
+
+	/** @edit Cached frame list for the current tab */
+	private cachedFrames: FrameInfo[] | null = null
 
 	constructor(tabsController: TabsController) {
 		this.tabsController = tabsController
@@ -46,6 +70,33 @@ export class RemotePageController {
 		return title || ''
 	}
 
+	/**
+	 * @edit Enumerate all frames in the current tab.
+	 * Returns [{ frameId, parentFrameId, url }, ...].
+	 * Falls back to [{ frameId: 0 }] if webNavigation is unavailable.
+	 */
+	private async getAllFrames(): Promise<FrameInfo[]> {
+		if (!this.currentTabId) return [{ frameId: 0, parentFrameId: -1, url: '' }]
+
+		try {
+			const result = await chrome.runtime.sendMessage({
+				type: 'PAGE_CONTROL',
+				action: 'get_all_frames',
+				targetTabId: this.currentTabId,
+			})
+			if (result?.frames && Array.isArray(result.frames) && result.frames.length > 0) {
+				this.cachedFrames = result.frames
+				return result.frames as FrameInfo[]
+			}
+		} catch (e) {
+			console.warn(PREFIX, 'getAllFrames failed, falling back to top frame only:', e)
+		}
+
+		// Fallback: just the top frame
+		const url = await this.getCurrentUrl()
+		return [{ frameId: 0, parentFrameId: -1, url }]
+	}
+
 	async getLastUpdateTime(): Promise<number> {
 		if (!this.currentTabId) throw new Error('tabsController not initialized.')
 		return sendMessage({
@@ -55,6 +106,11 @@ export class RemotePageController {
 		})
 	}
 
+	/**
+	 * @edit Multi-frame getBrowserState.
+	 * Enumerates all frames, fetches browser state from each, merges with
+	 * global index offsets.
+	 */
 	async getBrowserState(): Promise<BrowserState> {
 		let browserState: BrowserState
 		debug('getBrowserState', this.currentTabId)
@@ -71,11 +127,20 @@ export class RemotePageController {
 				footer: '',
 			}
 		} else {
-			browserState = await sendMessage({
-				type: 'PAGE_CONTROL',
-				action: 'get_browser_state',
-				targetTabId: this.currentTabId,
-			})
+			// @edit: Get all frames and fetch state from each
+			const frames = await this.getAllFrames()
+
+			if (frames.length <= 1) {
+				// Single frame (no iframes) — use original behavior
+				browserState = await sendMessage({
+					type: 'PAGE_CONTROL',
+					action: 'get_browser_state',
+					targetTabId: this.currentTabId,
+				})
+			} else {
+				// Multi-frame: fetch state from each frame in parallel
+				browserState = await this.getMultiFrameBrowserState(frames, currentUrl, currentTitle)
+			}
 		}
 
 		const sum = await this.tabsController.summarizeTabs()
@@ -86,16 +151,142 @@ export class RemotePageController {
 		return browserState
 	}
 
+	/**
+	 * @edit Fetch browser state from multiple frames and merge them.
+	 * Each frame's local indices [N] are remapped to global indices [N + offset].
+	 */
+	private async getMultiFrameBrowserState(
+		frames: FrameInfo[],
+		currentUrl: string,
+		currentTitle: string
+	): Promise<BrowserState> {
+		this.indexRouteMap.clear()
+
+		const OFFSET_PER_FRAME = 1000
+
+		// Sort: top frame (frameId=0) first, then by frameId
+		const sortedFrames = [...frames].sort((a, b) => {
+			if (a.frameId === 0) return -1
+			if (b.frameId === 0) return 1
+			return a.frameId - b.frameId
+		})
+
+		// Fetch state from each frame in parallel
+		const frameResults = await Promise.all(
+			sortedFrames.map(async (frame) => {
+				try {
+					const state = await sendMessage({
+						type: 'PAGE_CONTROL',
+						action: 'get_browser_state',
+						targetTabId: this.currentTabId!,
+						frameId: frame.frameId,
+					})
+					return { frame, state: state as BrowserState | null }
+				} catch (e) {
+					debug(`Failed to get state from frame ${frame.frameId}:`, e)
+					return { frame, state: null }
+				}
+			})
+		)
+
+		// Merge states with index remapping
+		const contentParts: string[] = []
+		let globalOffset = 0
+		let topHeader = ''
+		let topFooter = ''
+
+		for (const { frame, state } of frameResults) {
+			if (!state || !state.content || state.content.startsWith('(empty')) {
+				continue
+			}
+
+			// Use the top frame's header/footer
+			if (frame.frameId === 0) {
+				topHeader = state.header || ''
+				topFooter = state.footer || ''
+			}
+
+			// Remap indices: [N] → [N + offset]
+			const { text, indices } = this.remapIndices(state.content, globalOffset)
+
+			if (indices.length > 0) {
+				// Add a label for iframe content so the LLM knows the context
+				const frameLabel = frame.frameId === 0
+					? ''
+					: `\n<!-- iframe content (frame ${frame.frameId}, url: ${frame.url}) -->\n`
+
+				contentParts.push(frameLabel + text)
+
+				// Record routing entries
+				for (const { globalIndex, localIndex } of indices) {
+					this.indexRouteMap.set(globalIndex, {
+						frameId: frame.frameId,
+						localIndex,
+					})
+				}
+			}
+
+			globalOffset += OFFSET_PER_FRAME
+		}
+
+		return {
+			url: currentUrl,
+			title: currentTitle,
+			header: topHeader,
+			content: contentParts.join('\n'),
+			footer: topFooter,
+		}
+	}
+
+	/**
+	 * @edit Remap local indices [N] in frame content to global indices [N + offset].
+	 * Returns the remapped text and a list of { globalIndex, localIndex } pairs.
+	 */
+	private remapIndices(
+		content: string,
+		offset: number
+	): {
+		text: string
+		indices: { globalIndex: number; localIndex: number }[]
+	} {
+		const indices: { globalIndex: number; localIndex: number }[] = []
+
+		// Match both [N] and *[N] formats (latter = new element)
+		const text = content.replace(
+			/(\*?)\[(\d+)\]/g,
+			(_match, star: string, numStr: string) => {
+				const localIndex = parseInt(numStr, 10)
+				const globalIndex = localIndex + offset
+				indices.push({ globalIndex, localIndex })
+				return `${star}[${globalIndex}]`
+			}
+		)
+
+		return { text, indices }
+	}
+
 	async updateTree(): Promise<void> {
 		if (!this.currentTabId || !isContentScriptAllowed(await this.getCurrentUrl())) {
 			return
 		}
 
-		await sendMessage({
-			type: 'PAGE_CONTROL',
-			action: 'update_tree',
-			targetTabId: this.currentTabId,
-		})
+		// @edit: Update tree in all frames (non-fatal if some fail)
+		const frames = this.cachedFrames || [{ frameId: 0, parentFrameId: -1, url: '' }]
+
+		await Promise.all(
+			frames.map(async (frame) => {
+				try {
+					await sendMessage({
+						type: 'PAGE_CONTROL',
+						action: 'update_tree',
+						targetTabId: this.currentTabId!,
+						frameId: frame.frameId,
+					})
+				} catch (e) {
+					// Non-fatal: some frames may not have content scripts
+				}
+			})
+		)
 	}
 
 	async cleanUpHighlights(): Promise<void> {
@@ -103,13 +294,29 @@ export class RemotePageController {
 			return
 		}
 
-		await sendMessage({
-			type: 'PAGE_CONTROL',
-			action: 'clean_up_highlights',
-			targetTabId: this.currentTabId,
-		})
+		// @edit: Clean up highlights in all frames
+		const frames = this.cachedFrames || [{ frameId: 0, parentFrameId: -1, url: '' }]
+
+		await Promise.all(
+			frames.map(async (frame) => {
+				try {
+					await sendMessage({
+						type: 'PAGE_CONTROL',
+						action: 'clean_up_highlights',
+						targetTabId: this.currentTabId!,
+						frameId: frame.frameId,
+					})
+				} catch (e) {
+					// Non-fatal
+				}
+			})
+		)
 	}
 
+	/**
+	 * @edit Multi-frame click: look up the global index in the route map,
+	 * then send the click action to the correct frame with the local index.
+	 */
 	async clickElement(...args: any[]): Promise<DomActionReturn> {
 		const res = await this.remoteCallDomAction('click_element', args)
 		// @note may cause page navigation, wait for 1 second to ensure the page loading started
@@ -133,6 +340,16 @@ export class RemotePageController {
 		return this.remoteCallDomAction('scroll_horizontally', args)
 	}
 
+	/** @edit New: send_keys action */
+	async sendKeys(...args: any[]): Promise<DomActionReturn> {
+		return this.remoteCallDomAction('send_keys', args)
+	}
+
+	/** @edit New: input_text_with_suggestion action */
+	async inputTextWithSuggestion(...args: any[]): Promise<DomActionReturn> {
+		return this.remoteCallDomAction('input_text_with_suggestion', args)
+	}
+
 	// `execute_javascript` is intentionally not implemented: AbortSignal cannot cross context
 
 	/** @note Managed by content script via storage polling. */
@@ -142,6 +359,11 @@ export class RemotePageController {
 	/** @note Managed by content script via storage polling. */
 	dispose(): void {}
 
+	/**
+	 * @edit Multi-frame aware action routing.
+	 * For index-based actions, looks up the global index in indexRouteMap
+	 * to find the correct frameId and local index.
+	 */
 	private async remoteCallDomAction(action: string, payload: any[]): Promise<DomActionReturn> {
 		if (!this.currentTabId) {
 			return { success: false, message: 'RemotePageController not initialized.' }
@@ -155,11 +377,59 @@ export class RemotePageController {
 			}
 		}
 
+		// @edit: For index-based actions, resolve the frameId from the route map
+		const INDEX_ACTIONS = [
+			'click_element',
+			'input_text',
+			'select_option',
+			'input_text_with_suggestion',
+		]
+
+		let frameId: number | undefined
+		let adjustedPayload = payload
+
+		if (INDEX_ACTIONS.includes(action) && payload.length > 0) {
+			const globalIndex = payload[0] as number
+			const route = this.indexRouteMap.get(globalIndex)
+
+			if (route) {
+				frameId = route.frameId
+				// Replace global index with local index in the payload
+				adjustedPayload = [route.localIndex, ...payload.slice(1)]
+			} else {
+				// Index not in route map — might be in the top frame
+				// (fallback for single-frame mode where route map is empty)
+				frameId = undefined // default: top frame
+			}
+		}
+
+		// For non-index actions like send_keys, scroll — send to top frame
+		// (or the currently active frame, which we can't easily determine)
+		if (action === 'send_keys' || action === 'scroll' || action === 'scroll_horizontally') {
+			// Check if a specific index was provided for scroll
+			if ((action === 'scroll' || action === 'scroll_horizontally') && payload.length > 0) {
+				// Scroll actions may have an index parameter
+				const scrollPayload = payload[0] as any
+				if (scrollPayload && typeof scrollPayload.index === 'number') {
+					const globalIndex = scrollPayload.index
+					const route = this.indexRouteMap.get(globalIndex)
+					if (route) {
+						frameId = route.frameId
+						adjustedPayload = [
+							{ ...scrollPayload, index: route.localIndex },
+							...payload.slice(1),
+						]
+					}
+				}
+			}
+		}
+
 		return sendMessage({
 			type: 'PAGE_CONTROL',
 			action: action,
 			targetTabId: this.currentTabId!,
-			payload,
+			payload: adjustedPayload,
+			frameId,
 		})
 	}
 }
