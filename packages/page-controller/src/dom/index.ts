@@ -51,11 +51,20 @@ const SEMANTIC_TAGS = new Set([
 
 /**
  * 用于检测可交互元素是否是新出现的。
+ * @edit: Changed from module-level WeakMap to a function that recreates it
+ * per getFlatTree call. The old WeakMap accumulated entries across pages
+ * and sessions (the URL strings stored as values were never released as
+ * long as the HTMLElement was alive). Per-call creation is cheap (WeakMap
+ * allocation is O(1)) and guarantees no cross-page leakage.
  */
-const newElementsCache = new WeakMap<HTMLElement, string>()
+let newElementsCache = new WeakMap<HTMLElement, string>()
 
 export function getFlatTree(config: DomConfig): FlatDomTree {
 	const viewportExpansion = resolveViewportExpansion(config.viewportExpansion)
+
+	// @edit: Reset the new-elements cache on each tree extraction.
+	// This prevents URL strings from accumulating across navigations.
+	newElementsCache = new WeakMap()
 
 	const interactiveBlacklist = [] as Element[]
 	for (const item of config.interactiveBlacklist || []) {
@@ -110,6 +119,10 @@ export function getFlatTree(config: DomConfig): FlatDomTree {
 	return elements
 }
 
+// @edit: Bound cache size to prevent unbounded growth from dynamic
+// attribute patterns. 128 entries is more than enough for any realistic
+// page; evict oldest on overflow.
+const GLOB_REGEX_CACHE_MAX = 128
 const globRegexCache = new Map<string, RegExp>()
 
 function globToRegex(pattern: string): RegExp {
@@ -117,6 +130,13 @@ function globToRegex(pattern: string): RegExp {
 	if (!regex) {
 		const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
 		regex = new RegExp(`^${escaped.replace(/\*/g, '.*')}$`)
+
+		// Evict oldest entry if cache is full
+		if (globRegexCache.size >= GLOB_REGEX_CACHE_MAX) {
+			const firstKey = globRegexCache.keys().next().value
+			if (firstKey !== undefined) globRegexCache.delete(firstKey)
+		}
+
 		globRegexCache.set(pattern, regex)
 	}
 	return regex

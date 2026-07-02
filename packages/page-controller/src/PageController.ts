@@ -185,6 +185,15 @@ export class PageController extends EventTarget {
 
 		dom.cleanUpHighlights()
 
+		// @edit: Release old DOM references before rebuilding.
+		// selectorMap holds InteractiveElementDomNode.ref → HTMLElement references.
+		// If we don't clear before getFlatTree(), the old refs keep detached
+		// DOM nodes alive across updates (especially after SPA navigation
+		// where the old DOM is gone but still referenced here).
+		this.selectorMap.clear()
+		this.elementTextMap.clear()
+		this.flatTree = null
+
 		const blacklist = [
 			...(this.config.interactiveBlacklist || []),
 			...Array.from(document.querySelectorAll('[data-page-agent-not-interactive]')),
@@ -201,10 +210,7 @@ export class PageController extends EventTarget {
 			this.config.keepSemanticTags
 		)
 
-		this.selectorMap.clear()
 		this.selectorMap = dom.getSelectorMap(this.flatTree)
-
-		this.elementTextMap.clear()
 		this.elementTextMap = dom.getElementTextMap(this.simplifiedHTML)
 
 		// Mark as indexed - now element actions are allowed
@@ -407,11 +413,23 @@ export class PageController extends EventTarget {
 			}
 		}
 
-		// Signal 2: Common class name patterns for suggestion lists
-		const classPattern = /autocomplete|suggestion|dropdown|typeahead|combobox|predictive/i
-		const allElements = document.querySelectorAll<HTMLElement>('[class]')
-		for (const el of allElements) {
-			if (classPattern.test(el.className) && this.isNearElement(inputElement, el)) {
+		// Signal 2: Targeted class-based search instead of scanning all elements.
+		// @edit: Previously used document.querySelectorAll('[class]') which
+		// iterates every element with a class attribute on every poll tick
+		// (200ms). On complex pages this is thousands of elements × regex.
+		// Now use specific class* selectors that leverage the browser's
+		// selector engine, which is far more efficient.
+		const classSelectors = [
+			'[class*="autocomplete" i]',
+			'[class*="suggestion" i]',
+			'[class*="dropdown" i]',
+			'[class*="typeahead" i]',
+			'[class*="combobox" i]',
+			'[class*="predictive" i]',
+		]
+		for (const sel of classSelectors) {
+			const el = document.querySelector<HTMLElement>(sel)
+			if (el && this.isNearElement(inputElement, el)) {
 				return true
 			}
 		}

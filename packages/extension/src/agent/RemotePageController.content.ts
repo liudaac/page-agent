@@ -26,6 +26,11 @@ export function initPageController() {
 			return null
 		})
 
+	// @edit: Detect if we're in a sub-frame (iframe).
+	// Sub-frames never need the mask overlay — only the top frame shows it.
+	// This avoids unnecessary mask initialization and DOM mutation in iframes.
+	const isTopFrame = window.top === window
+
 	function getPC(): PageController {
 		if (!pageController) {
 			pageController = new PageController({
@@ -37,23 +42,33 @@ export function initPageController() {
 	}
 
 	intervalID = window.setInterval(async () => {
-		const agentHeartbeat = (await chrome.storage.local.get('agentHeartbeat')).agentHeartbeat
+		// @edit: Batch all storage reads into one call to reduce overhead.
+		// With allFrames:true, N iframes × 3 reads = 3N storage calls per tick.
+		// Now it's N × 1 batched call.
+		const { agentHeartbeat, isAgentRunning, currentTabId } =
+			await chrome.storage.local.get([
+				'agentHeartbeat',
+				'isAgentRunning',
+				'currentTabId',
+			])
+
 		const now = Date.now()
 		const agentInTouch = typeof agentHeartbeat === 'number' && now - agentHeartbeat < 2_000
 
-		const isAgentRunning = (await chrome.storage.local.get('isAgentRunning')).isAgentRunning
-		const currentTabId = (await chrome.storage.local.get('currentTabId')).currentTabId
-
-		const shouldShowMask = isAgentRunning && agentInTouch && currentTabId === (await myTabIdPromise)
+		const myTabId = await myTabIdPromise
+		// @edit: Only the top frame should show/hide the mask.
+		// Sub-frames just need to keep their PageController alive for
+		// remote DOM operations, but never manage the mask.
+		const shouldShowMask =
+			isTopFrame && isAgentRunning && agentInTouch && currentTabId === myTabId
 
 		if (shouldShowMask) {
 			const pc = getPC()
 			pc.initMask()
 			await pc.showMask()
 		} else {
-			// await getPC().hideMask()
 			if (pageController) {
-				pageController.hideMask()
+				if (isTopFrame) pageController.hideMask()
 				pageController.cleanUpHighlights()
 			}
 		}
