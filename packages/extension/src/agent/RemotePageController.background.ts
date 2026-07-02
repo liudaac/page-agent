@@ -64,7 +64,7 @@ export function handlePageControlMessage(
 
 	// @edit: If frameId is specified, route to that specific frame.
 	// Otherwise, sendMessage goes to the top-level frame only (default behavior).
-	const sendOptions: chrome.tabs.SendMessageOptions = frameId !== undefined
+	const sendOptions: chrome.tabs.MessageSendOptions = frameId !== undefined
 		? { frameId }
 		: {}
 

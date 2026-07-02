@@ -326,7 +326,7 @@ export class PageController extends EventTarget {
 			const elemText = this.elementTextMap.get(index)
 			const timeout = options?.timeout ?? 3000
 
-			// Record element count before input
+			// Record element count before input (used as secondary signal)
 			const countBefore = this.selectorMap.size
 
 			// Type character by character, keeping focus
@@ -335,13 +335,18 @@ export class PageController extends EventTarget {
 				keepFocus: true,
 			})
 
-			// Poll for new interactive elements (suggestion list)
+			// Poll for suggestion list appearance.
+			// @edit: Instead of relying solely on selectorMap.size change (which
+			// can be triggered by any DOM change), we check for characteristic
+			// suggestion patterns: elements with autocomplete roles, or new
+			// interactive elements appearing near the input element.
 			const startTime = Date.now()
 			let suggestionsAppeared = false
 
 			while (Date.now() - startTime < timeout) {
 				await this.updateTree()
-				if (this.selectorMap.size > countBefore) {
+
+				if (this.detectSuggestions(element, countBefore)) {
 					suggestionsAppeared = true
 					break
 				}
@@ -371,6 +376,74 @@ export class PageController extends EventTarget {
 				message: `❌ Failed to input text with suggestion: ${error}`,
 			}
 		}
+	}
+
+	/**
+	 * Detect whether autocomplete suggestions have appeared.
+	 * Checks for characteristic suggestion patterns rather than just
+	 * counting interactive elements (which causes false positives from
+	 * unrelated DOM changes like ads, notifications, etc.).
+	 *
+	 * Detection signals (any one is sufficient):
+	 * 1. ARIA roles: listbox, option, combobox, treeitem, menuitem
+	 * 2. Common class name patterns: autocomplete, suggestion, dropdown, typeahead
+	 * 3. New interactive elements near the input (within 200px below)
+	 * 4. Significant increase in interactive element count (>3 new elements)
+	 */
+	private detectSuggestions(inputElement: HTMLElement, countBefore: number): boolean {
+		// Signal 1: ARIA roles that indicate suggestion lists
+		const suggestionSelectors = [
+			'[role="listbox"]',
+			'[role="option"]',
+			'[role="combobox"]',
+			'[role="treeitem"]',
+			'[role="menuitem"]',
+			'[aria-expanded="true"]',
+		]
+		for (const sel of suggestionSelectors) {
+			const el = document.querySelector<HTMLElement>(sel)
+			if (el && this.isNearElement(inputElement, el)) {
+				return true
+			}
+		}
+
+		// Signal 2: Common class name patterns for suggestion lists
+		const classPattern = /autocomplete|suggestion|dropdown|typeahead|combobox|predictive/i
+		const allElements = document.querySelectorAll<HTMLElement>('[class]')
+		for (const el of allElements) {
+			if (classPattern.test(el.className) && this.isNearElement(inputElement, el)) {
+				return true
+			}
+		}
+
+		// Signal 3: Many new interactive elements appeared (>3), suggesting a list
+		const countAfter = this.selectorMap.size
+		if (countAfter - countBefore >= 3) {
+			return true
+		}
+
+		return false
+	}
+
+	/**
+	 * Check if an element is "near" the input element.
+	 * Near = within 300px horizontally and 300px below the input.
+	 */
+	private isNearElement(input: HTMLElement, target: HTMLElement): boolean {
+		const inputRect = input.getBoundingClientRect()
+		const targetRect = target.getBoundingClientRect()
+
+		const horizontalOverlap =
+			targetRect.right > inputRect.left - 50 &&
+			targetRect.left < inputRect.right + 50
+
+		const isBelow = targetRect.top >= inputRect.bottom - 20 &&
+			targetRect.top <= inputRect.bottom + 300
+
+		const isOverlapping = targetRect.bottom > inputRect.top &&
+			targetRect.top < inputRect.bottom
+
+		return horizontalOverlap && (isBelow || isOverlapping)
 	}
 
 	/**

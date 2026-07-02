@@ -50,6 +50,12 @@ export class RemotePageController {
 	/** @edit Cached frame list for the current tab */
 	private cachedFrames: FrameInfo[] | null = null
 
+	/**
+	 * @edit Track the frameId of the most recent index-based action.
+	 * send_keys (which has no index) uses this to route to the correct frame.
+	 */
+	private lastActionFrameId: number | undefined = undefined
+
 	constructor(tabsController: TabsController) {
 		this.tabsController = tabsController
 	}
@@ -162,7 +168,9 @@ export class RemotePageController {
 	): Promise<BrowserState> {
 		this.indexRouteMap.clear()
 
-		const OFFSET_PER_FRAME = 1000
+		// @edit: Removed fixed OFFSET_PER_FRAME=1000. Instead, dynamically
+		// accumulate offset based on the actual number of indices in each
+		// frame, plus a small gap to avoid boundary collisions.
 
 		// Sort: top frame (frameId=0) first, then by frameId
 		const sortedFrames = [...frames].sort((a, b) => {
@@ -224,9 +232,15 @@ export class RemotePageController {
 						localIndex,
 					})
 				}
-			}
 
-			globalOffset += OFFSET_PER_FRAME
+				// @edit: Advance offset by the actual number of indices found,
+				// plus a 10-element gap to prevent off-by-one collisions.
+				const maxLocalIndex = indices.reduce(
+					(max, idx) => Math.max(max, idx.localIndex),
+					0
+				)
+				globalOffset += maxLocalIndex + 10
+			}
 		}
 
 		return {
@@ -251,14 +265,17 @@ export class RemotePageController {
 	} {
 		const indices: { globalIndex: number; localIndex: number }[] = []
 
-		// Match both [N] and *[N] formats (latter = new element)
+		// @edit: Only match index markers like [N]<tag or *[N]<tag.
+		// The previous regex /(\*?)\[(\d+)\]/g would also match [0] inside
+		// element text content (e.g. "Array index [0] is the first element").
+		// By requiring < after the bracket, we only match actual element markers.
 		const text = content.replace(
-			/(\*?)\[(\d+)\]/g,
+			/(\*?)\[(\d+)\]</g,
 			(_match, star: string, numStr: string) => {
 				const localIndex = parseInt(numStr, 10)
 				const globalIndex = localIndex + offset
 				indices.push({ globalIndex, localIndex })
-				return `${star}[${globalIndex}]`
+				return `${star}[${globalIndex}]<`
 			}
 		)
 
@@ -390,38 +407,52 @@ export class RemotePageController {
 
 		if (INDEX_ACTIONS.includes(action) && payload.length > 0) {
 			const globalIndex = payload[0] as number
-			const route = this.indexRouteMap.get(globalIndex)
+			let route = this.indexRouteMap.get(globalIndex)
+
+			// @edit: If the index is not in the route map, the page may have
+			// changed since the last getBrowserState(). Refresh once and retry
+			// before falling back to the top frame.
+			if (!route && this.cachedFrames && this.cachedFrames.length > 1) {
+				debug(`Index ${globalIndex} not in route map, refreshing browser state...`)
+				await this.getBrowserState()
+				route = this.indexRouteMap.get(globalIndex)
+			}
 
 			if (route) {
 				frameId = route.frameId
+				// Remember this frame for subsequent non-index actions (send_keys)
+				this.lastActionFrameId = route.frameId
 				// Replace global index with local index in the payload
 				adjustedPayload = [route.localIndex, ...payload.slice(1)]
 			} else {
-				// Index not in route map — might be in the top frame
-				// (fallback for single-frame mode where route map is empty)
+				// Index still not found after refresh — fall back to top frame.
+				// This covers single-frame mode where route map is not populated.
 				frameId = undefined // default: top frame
+				this.lastActionFrameId = undefined
 			}
 		}
 
-		// For non-index actions like send_keys, scroll — send to top frame
-		// (or the currently active frame, which we can't easily determine)
-		if (action === 'send_keys' || action === 'scroll' || action === 'scroll_horizontally') {
-			// Check if a specific index was provided for scroll
-			if ((action === 'scroll' || action === 'scroll_horizontally') && payload.length > 0) {
-				// Scroll actions may have an index parameter
-				const scrollPayload = payload[0] as any
-				if (scrollPayload && typeof scrollPayload.index === 'number') {
-					const globalIndex = scrollPayload.index
-					const route = this.indexRouteMap.get(globalIndex)
-					if (route) {
-						frameId = route.frameId
-						adjustedPayload = [
-							{ ...scrollPayload, index: route.localIndex },
-							...payload.slice(1),
-						]
-					}
+		// For scroll actions with an index parameter, resolve the frame
+		if ((action === 'scroll' || action === 'scroll_horizontally') && payload.length > 0) {
+			const scrollPayload = payload[0] as any
+			if (scrollPayload && typeof scrollPayload.index === 'number') {
+				const globalIndex = scrollPayload.index
+				const route = this.indexRouteMap.get(globalIndex)
+				if (route) {
+					frameId = route.frameId
+					this.lastActionFrameId = route.frameId
+					adjustedPayload = [
+						{ ...scrollPayload, index: route.localIndex },
+						...payload.slice(1),
+					]
 				}
 			}
+		}
+
+		// @edit: send_keys has no index — route to the frame of the last
+		// index-based action (where the focus element likely lives).
+		if (action === 'send_keys') {
+			frameId = this.lastActionFrameId
 		}
 
 		return sendMessage({

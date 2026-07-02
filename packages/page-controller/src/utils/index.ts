@@ -65,6 +65,25 @@ export async function waitFor(seconds: number): Promise<void> {
 }
 
 // ======= mask events =======
+// @edit: In multi-frame mode (allFrames: true), each frame's content script
+// has its own window. SimulatorMask lives in the top frame, so mask-related
+// events must also be dispatched to window.top for the mask to react.
+
+/**
+ * Dispatch a CustomEvent to both the current window and the top window.
+ * When running inside an iframe, the top frame's SimulatorMask needs
+ * these events to coordinate mask state (pass-through, cursor animation).
+ */
+function dispatchToTopAndSelf(event: CustomEvent): void {
+	window.dispatchEvent(event)
+	if (window.top && window.top !== window) {
+		try {
+			window.top.dispatchEvent(event)
+		} catch (e) {
+			// Cross-origin window.top may throw — ignore, same-origin works
+		}
+	}
+}
 
 /**
  * Move the visual pointer to a position within an element.
@@ -74,7 +93,7 @@ export async function waitFor(seconds: number): Promise<void> {
 export async function movePointerToElement(element: HTMLElement, x: number, y: number) {
 	const offset = getIframeOffset(element)
 
-	window.dispatchEvent(
+	dispatchToTopAndSelf(
 		new CustomEvent('PageAgent::MovePointerTo', {
 			detail: { x: x + offset.x, y: y + offset.y },
 		})
@@ -84,13 +103,13 @@ export async function movePointerToElement(element: HTMLElement, x: number, y: n
 }
 
 export async function clickPointer() {
-	window.dispatchEvent(new CustomEvent('PageAgent::ClickPointer'))
+	dispatchToTopAndSelf(new CustomEvent('PageAgent::ClickPointer'))
 }
 
 export async function enablePassThrough() {
-	window.dispatchEvent(new CustomEvent('PageAgent::EnablePassThrough'))
+	dispatchToTopAndSelf(new CustomEvent('PageAgent::EnablePassThrough'))
 }
 
 export async function disablePassThrough() {
-	window.dispatchEvent(new CustomEvent('PageAgent::DisablePassThrough'))
+	dispatchToTopAndSelf(new CustomEvent('PageAgent::DisablePassThrough'))
 }
